@@ -17,7 +17,12 @@ const MAX_AGE_DAYS = 2;
 
 function loadDb() {
   if (!fs.existsSync(DB_PATH)) return { postedUrls: [] };
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+
+  try {
+    return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+  } catch {
+    return { postedUrls: [] };
+  }
 }
 
 function saveDb(db) {
@@ -35,19 +40,18 @@ function fullUrl(url, base) {
 }
 
 function isFresh(dateText) {
-  if (!dateText) return true;
+  if (!dateText) return false;
 
-  const now = Date.now();
   const parsed = Date.parse(dateText);
+  if (Number.isNaN(parsed)) return false;
 
-  if (Number.isNaN(parsed)) return true;
-
-  const diffDays = (now - parsed) / (1000 * 60 * 60 * 24);
-  return diffDays <= MAX_AGE_DAYS;
+  const diffDays = (Date.now() - parsed) / (1000 * 60 * 60 * 24);
+  return diffDays >= 0 && diffDays <= MAX_AGE_DAYS;
 }
 
 function unique(items) {
   const seen = new Set();
+
   return items.filter(item => {
     if (!item.link || seen.has(item.link)) return false;
     seen.add(item.link);
@@ -58,7 +62,8 @@ function unique(items) {
 async function parseArticleDetails(link) {
   try {
     const { data } = await axios.get(link, {
-      headers: { "User-Agent": "Mozilla/5.0" }
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 15000
     });
 
     const $ = cheerio.load(data);
@@ -71,15 +76,18 @@ async function parseArticleDetails(link) {
     const date =
       $("time").attr("datetime") ||
       $('meta[property="article:published_time"]').attr("content") ||
+      $('meta[name="date"]').attr("content") ||
       $(".date").first().text();
 
     const description =
       clean($('meta[property="og:description"]').attr("content")) ||
+      clean($('meta[name="description"]').attr("content")) ||
       clean($("article p").first().text()) ||
       clean($("p").first().text());
 
     return { image, date, description };
-  } catch {
+  } catch (e) {
+    console.log("Не смог открыть статью:", link, e.message);
     return { image: null, date: null, description: "" };
   }
 }
@@ -87,7 +95,8 @@ async function parseArticleDetails(link) {
 async function parseSkigu() {
   const base = "https://skigu.ru/news/";
   const { data } = await axios.get(base, {
-    headers: { "User-Agent": "Mozilla/5.0" }
+    headers: { "User-Agent": "Mozilla/5.0" },
+    timeout: 15000
   });
 
   const $ = cheerio.load(data);
@@ -113,7 +122,8 @@ async function parseSkigu() {
 async function parseSkiRu() {
   const base = "https://www.ski.ru/static/300/";
   const { data } = await axios.get(base, {
-    headers: { "User-Agent": "Mozilla/5.0" }
+    headers: { "User-Agent": "Mozilla/5.0" },
+    timeout: 15000
   });
 
   const $ = cheerio.load(data);
@@ -148,14 +158,18 @@ async function collectNews() {
   }
 
   all = unique(all);
-
   const detailed = [];
 
   for (const item of all) {
     const details = await parseArticleDetails(item.link);
 
+    if (!details.image) {
+      console.log("Нет картинки, пропускаю:", item.title);
+      continue;
+    }
+
     if (!isFresh(details.date)) {
-      console.log("Старая новость, пропускаю:", item.title);
+      console.log("Старая/без даты, пропускаю:", item.title, details.date || "нет даты");
       continue;
     }
 
@@ -201,44 +215,42 @@ async function publishOne() {
   const db = loadDb();
   const news = await collectNews();
 
-  console.log("Найдено свежих новостей:", news.length);
+  console.log("Найдено подходящих свежих новостей с картинкой:", news.length);
 
-  const fresh = news.find(item => !db.postedUrls.includes(item.link));
+  const fresh = news.find(item => {
+    if (db.postedUrls.includes(item.link)) {
+      console.log("Дубль, пропускаю:", item.title);
+      return false;
+    }
+
+    return true;
+  });
 
   if (!fresh) {
-    console.log("Новых неповторяющихся новостей нет");
+    console.log("Новых неповторяющихся новостей с картинкой нет");
     return;
   }
 
   const text = await rewrite(fresh);
   const message = `${text}\n\nИсточник: ${fresh.link}`;
 
-  if (fresh.image) {
-    try {
-      await bot.sendPhoto(CHANNEL, fresh.image, {
-        caption: message.slice(0, 1024)
-      });
-      console.log("Опубликовано с картинкой:", fresh.title);
-    } catch (e) {
-      console.log("Фото не отправилось, отправляю текстом:", e.message);
-      await bot.sendMessage(CHANNEL, message, {
-        disable_web_page_preview: false
-      });
-    }
-  } else {
-    await bot.sendMessage(CHANNEL, message, {
-      disable_web_page_preview: false
+  try {
+    await bot.sendPhoto(CHANNEL, fresh.image, {
+      caption: message.slice(0, 1024)
     });
-    console.log("Опубликовано без картинки:", fresh.title);
-  }
 
-  db.postedUrls.push(fresh.link);
-  db.postedUrls = db.postedUrls.slice(-500);
-  saveDb(db);
+    db.postedUrls.push(fresh.link);
+    db.postedUrls = db.postedUrls.slice(-1000);
+    saveDb(db);
+
+    console.log("Опубликовано:", fresh.title);
+  } catch (e) {
+    console.log("Фото не отправилось, новость НЕ публикую:", fresh.title, e.message);
+  }
 }
 
-console.log("Бот запущен. Тестовый режим: каждые 10 минут.");
+console.log("Бот запущен. Режим: каждые 3 часа, только свежие до 2 дней, только с картинкой, без дублей.");
 
 publishOne();
 
-cron.schedule("*/10 * * * *", publishOne);
+cron.schedule("0 */3 * * *", publishOne);
