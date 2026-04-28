@@ -19,7 +19,9 @@ function loadDb() {
   if (!fs.existsSync(DB_PATH)) return { postedUrls: [] };
 
   try {
-    return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    const db = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    if (!Array.isArray(db.postedUrls)) db.postedUrls = [];
+    return db;
   } catch {
     return { postedUrls: [] };
   }
@@ -40,10 +42,10 @@ function fullUrl(url, base) {
 }
 
 function isFresh(dateText) {
-  if (!dateText) return false;
+  if (!dateText) return true;
 
   const parsed = Date.parse(dateText);
-  if (Number.isNaN(parsed)) return false;
+  if (Number.isNaN(parsed)) return true;
 
   const diffDays = (Date.now() - parsed) / (1000 * 60 * 60 * 24);
   return diffDays >= 0 && diffDays <= MAX_AGE_DAYS;
@@ -71,7 +73,9 @@ async function parseArticleDetails(link) {
     const image =
       fullUrl($('meta[property="og:image"]').attr("content"), link) ||
       fullUrl($("article img").first().attr("src"), link) ||
-      fullUrl($("img").first().attr("src"), link);
+      fullUrl($("article img").first().attr("data-src"), link) ||
+      fullUrl($("img").first().attr("src"), link) ||
+      fullUrl($("img").first().attr("data-src"), link);
 
     const date =
       $("time").attr("datetime") ||
@@ -163,13 +167,8 @@ async function collectNews() {
   for (const item of all) {
     const details = await parseArticleDetails(item.link);
 
-    if (!details.image) {
-      console.log("Нет картинки, пропускаю:", item.title);
-      continue;
-    }
-
     if (!isFresh(details.date)) {
-      console.log("Старая/без даты, пропускаю:", item.title, details.date || "нет даты");
+      console.log("Старая новость, пропускаю:", item.title, details.date || "нет даты");
       continue;
     }
 
@@ -215,7 +214,7 @@ async function publishOne() {
   const db = loadDb();
   const news = await collectNews();
 
-  console.log("Найдено подходящих свежих новостей с картинкой:", news.length);
+  console.log("Найдено свежих новостей:", news.length);
 
   const fresh = news.find(item => {
     if (db.postedUrls.includes(item.link)) {
@@ -227,7 +226,7 @@ async function publishOne() {
   });
 
   if (!fresh) {
-    console.log("Новых неповторяющихся новостей с картинкой нет");
+    console.log("Новых неповторяющихся новостей нет");
     return;
   }
 
@@ -235,21 +234,29 @@ async function publishOne() {
   const message = `${text}\n\nИсточник: ${fresh.link}`;
 
   try {
-    await bot.sendPhoto(CHANNEL, fresh.image, {
-      caption: message.slice(0, 1024)
-    });
+    if (fresh.image) {
+      await bot.sendPhoto(CHANNEL, fresh.image, {
+        caption: message.slice(0, 1024)
+      });
+
+      console.log("Опубликовано с картинкой:", fresh.title);
+    } else {
+      await bot.sendMessage(CHANNEL, message, {
+        disable_web_page_preview: false
+      });
+
+      console.log("Опубликовано без картинки:", fresh.title);
+    }
 
     db.postedUrls.push(fresh.link);
-    db.postedUrls = db.postedUrls.slice(-1000);
+    db.postedUrls = [...new Set(db.postedUrls)].slice(-1000);
     saveDb(db);
-
-    console.log("Опубликовано:", fresh.title);
   } catch (e) {
-    console.log("Фото не отправилось, новость НЕ публикую:", fresh.title, e.message);
+    console.log("Ошибка публикации:", fresh.title, e.message);
   }
 }
 
-console.log("Бот запущен. Режим: каждые 3 часа, только свежие до 2 дней, только с картинкой, без дублей.");
+console.log("Бот запущен. Режим: каждые 3 часа, свежие до 2 дней, без дублей.");
 
 publishOne();
 
